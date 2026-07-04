@@ -13,6 +13,31 @@ export function serializeRow(row: object): object {
   return result;
 }
 
+/** Anything with a `parse(value): T` method — notably a Zod schema. Unlike a
+ *  JSON-Schema (`tjs`) validator, a parse-validator receives the RAW postgres
+ *  row: `Date` values and `null` columns are preserved, so nullable columns are
+ *  `.nullable()` (present-and-null), not omitted. */
+export interface ParseValidator<T> {
+  parse(value: unknown): T;
+}
+
+/** A row validator is either a `tjs` `Validator<T>` (JSON-Schema; the row is
+ *  normalized via {@link serializeRow} before validation) or a
+ *  {@link ParseValidator} such as a Zod schema (the raw row is validated). */
+export type RowValidator<T> = Validator<T> | ParseValidator<T>;
+
+function isAssertValidator<T>(validator: RowValidator<T>): validator is Validator<T> {
+  return typeof (validator as Validator<T>).assert === "function";
+}
+
+/** tjs validators get the JSON-normalized row; parse-validators (Zod) get the
+ *  raw postgres row so `Date`/`null` survive to the schema unchanged. */
+function validateRow<T>(validator: RowValidator<T>, row: object): T {
+  return isAssertValidator(validator)
+    ? validator.assert(serializeRow(row))
+    : validator.parse(row);
+}
+
 // The callable subset shared by postgres.Sql and postgres.TransactionSql —
 // the two don't share a supertype in postgres.js's typings.
 type QueryTag = (strings: TemplateStringsArray, ...values: readonly unknown[]) => Promise<postgres.Row[]>;
@@ -26,28 +51,28 @@ export class TypedDb {
     this.tag = this.raw as unknown as QueryTag;
   }
 
-  one<T>(validator: Validator<T>) {
+  one<T>(validator: RowValidator<T>) {
     return async (strings: TemplateStringsArray, ...values: readonly unknown[]): Promise<T> => {
       const rows = await this.tag(strings, ...(values as never[]));
       if (rows.length === 0) throw new Error("Expected one row, got none");
-      return validator.assert(serializeRow(rows[0]));
+      return validateRow(validator, rows[0]);
     };
   }
 
-  maybeOne<T>(validator: Validator<T>) {
+  maybeOne<T>(validator: RowValidator<T>) {
     return async (
       strings: TemplateStringsArray,
       ...values: readonly unknown[]
     ): Promise<T | undefined> => {
       const rows = await this.tag(strings, ...(values as never[]));
-      return rows.length > 0 ? validator.assert(serializeRow(rows[0])) : undefined;
+      return rows.length > 0 ? validateRow(validator, rows[0]) : undefined;
     };
   }
 
-  many<T>(validator: Validator<T>) {
+  many<T>(validator: RowValidator<T>) {
     return async (strings: TemplateStringsArray, ...values: readonly unknown[]): Promise<T[]> => {
       const rows = await this.tag(strings, ...(values as never[]));
-      return rows.map((r) => validator.assert(serializeRow(r)));
+      return rows.map((r) => validateRow(validator, r));
     };
   }
 
