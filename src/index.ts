@@ -1,0 +1,86 @@
+import postgres from "postgres";
+import type { Validator } from "tjs";
+
+/** Normalize postgres rows for JSON Schema validation:
+ *  - Date -> ISO string
+ *  - null -> omitted (matches `optional: true` in validators) */
+export function serializeRow(row: object): object {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (value === null) continue;
+    result[key] = value instanceof Date ? value.toISOString() : value;
+  }
+  return result;
+}
+
+// The callable subset shared by postgres.Sql and postgres.TransactionSql —
+// the two don't share a supertype in postgres.js's typings.
+type QueryTag = (strings: TemplateStringsArray, ...values: readonly unknown[]) => Promise<postgres.Row[]>;
+
+export class TypedDb {
+  private raw: postgres.Sql;
+  private tag: QueryTag;
+
+  constructor(connectionString: string) {
+    this.raw = postgres(connectionString);
+    this.tag = this.raw as unknown as QueryTag;
+  }
+
+  one<T>(validator: Validator<T>) {
+    return async (strings: TemplateStringsArray, ...values: readonly unknown[]): Promise<T> => {
+      const rows = await this.tag(strings, ...(values as never[]));
+      if (rows.length === 0) throw new Error("Expected one row, got none");
+      return validator.assert(serializeRow(rows[0]));
+    };
+  }
+
+  maybeOne<T>(validator: Validator<T>) {
+    return async (
+      strings: TemplateStringsArray,
+      ...values: readonly unknown[]
+    ): Promise<T | undefined> => {
+      const rows = await this.tag(strings, ...(values as never[]));
+      return rows.length > 0 ? validator.assert(serializeRow(rows[0])) : undefined;
+    };
+  }
+
+  many<T>(validator: Validator<T>) {
+    return async (strings: TemplateStringsArray, ...values: readonly unknown[]): Promise<T[]> => {
+      const rows = await this.tag(strings, ...(values as never[]));
+      return rows.map((r) => validator.assert(serializeRow(r)));
+    };
+  }
+
+  exec(strings: TemplateStringsArray, ...values: readonly unknown[]): Promise<void> {
+    return this.tag(strings, ...(values as never[])).then(() => {});
+  }
+
+  /** Run `fn` inside a transaction. The TypedDb passed to `fn` issues every
+   *  query on the transaction's connection; it commits when `fn` resolves and
+   *  rolls back when `fn` throws. Nested `begin` is not supported. */
+  async begin<T>(fn: (tx: TypedDb) => Promise<T>): Promise<T> {
+    if (this.tag !== this.raw) throw new Error("Nested transactions are not supported");
+    const result = await this.raw.begin((sql) => {
+      // A transaction-scoped view over the same pool: identical API, but every
+      // template tag runs on the transaction's reserved connection.
+      const tx = Object.create(TypedDb.prototype) as TypedDb;
+      tx.raw = this.raw;
+      tx.tag = sql as unknown as QueryTag;
+      return fn(tx);
+    });
+    return result as T;
+  }
+
+  json(value: Record<string, unknown>): postgres.Parameter {
+    return this.raw.json(value as postgres.JSONValue);
+  }
+
+  async end(): Promise<void> {
+    if (this.tag !== this.raw) throw new Error("Cannot end the pool from inside a transaction");
+    await this.raw.end();
+  }
+}
+
+export function createDb(connectionString: string): TypedDb {
+  return new TypedDb(connectionString);
+}
