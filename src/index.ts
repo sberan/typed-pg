@@ -42,12 +42,37 @@ function validateRow<T>(validator: RowValidator<T>, row: object): T {
 // the two don't share a supertype in postgres.js's typings.
 type QueryTag = (strings: TemplateStringsArray, ...values: readonly unknown[]) => Promise<postgres.Row[]>;
 
+// postgres.js returns json/jsonb columns as raw text; node-pg parses them into
+// JS values. To match node-pg (the ubiquitous expectation, and what row
+// schemas written against it assume) json (oid 114) and jsonb (oid 3802) are
+// parsed on read. Serialization is left alone for text: a string parameter —
+// the `${JSON.stringify(x)}::jsonb` pattern — passes through untouched (no
+// double-encoding), and a non-string parameter is JSON-encoded once.
+const JSON_TYPE = {
+  to: 114,
+  from: [114, 3802],
+  serialize: (value: unknown) => (typeof value === "string" ? value : JSON.stringify(value)),
+  parse: (value: string) => JSON.parse(value),
+};
+
+function withJsonParsing(
+  options: postgres.Options<Record<string, postgres.PostgresType>> | undefined,
+): postgres.Options<Record<string, postgres.PostgresType>> {
+  return {
+    ...options,
+    types: { json: JSON_TYPE as unknown as postgres.PostgresType, ...(options?.types ?? {}) },
+  };
+}
+
 export class TypedDb {
   private raw: postgres.Sql;
   private tag: QueryTag;
 
-  constructor(connectionString: string) {
-    this.raw = postgres(connectionString);
+  constructor(
+    connectionString: string,
+    options?: postgres.Options<Record<string, postgres.PostgresType>>,
+  ) {
+    this.raw = postgres(connectionString, withJsonParsing(options));
     this.tag = this.raw as unknown as QueryTag;
   }
 
@@ -106,6 +131,9 @@ export class TypedDb {
   }
 }
 
-export function createDb(connectionString: string): TypedDb {
-  return new TypedDb(connectionString);
+export function createDb(
+  connectionString: string,
+  options?: postgres.Options<Record<string, postgres.PostgresType>>,
+): TypedDb {
+  return new TypedDb(connectionString, options);
 }

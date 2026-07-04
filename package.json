@@ -1,6 +1,6 @@
 {
   "name": "@sberan/typed-pg",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Typed Postgres queries: postgres.js template tags validated by tjs JSON Schema validators",
   "type": "module",
   "main": "./dist/index.js",
